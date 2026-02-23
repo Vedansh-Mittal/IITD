@@ -1,13 +1,57 @@
 #!/usr/bin/env python3
-"""Export notebook to a beautifully styled HTML for PDF printing."""
-import json, sys, markdown
+"""Export notebook to a beautifully styled HTML for PDF printing.
 
-# ── Which notebook to export ──
-nb_path = sys.argv[1] if len(sys.argv) > 1 else "eda_report_clean.ipynb"
+Usage:
+  python3 export_html.py [notebook.ipynb] [--no-execute]
+
+By default the notebook is executed in-place (outputs refreshed) before
+exporting so that newly-added chart cells (e.g. chart_4a_boxplot, etc.)
+produce their PNG outputs in the HTML.  Pass --no-execute to skip execution
+and use whatever outputs are already stored.
+"""
+import json, sys, re, html as html_mod
+import markdown
+
+# ── CLI args ──
+args = sys.argv[1:]
+no_execute = "--no-execute" in args
+args = [a for a in args if not a.startswith("--")]
+nb_path = args[0] if args else "eda_report_clean.ipynb"
 out_path = nb_path.replace(".ipynb", ".html")
 
-nb = json.load(open(nb_path))
+# ── Optionally execute the notebook ──
+if not no_execute:
+    try:
+        import nbformat
+        from nbconvert.preprocessors import ExecutePreprocessor
 
+        print(f"⏳ Executing notebook: {nb_path}  (this may take ~30 s) …")
+        with open(nb_path, encoding="utf-8") as f:
+            nb_node = nbformat.read(f, as_version=4)
+
+        ep = ExecutePreprocessor(
+            timeout=300,          # 5-minute timeout per cell
+            kernel_name="python3",
+            allow_errors=True,    # don't abort on cell errors
+        )
+        ep.preprocess(nb_node, {"metadata": {"path": "."}})
+
+        # Write executed notebook back so Jupyter also shows the outputs
+        with open(nb_path, "w", encoding="utf-8") as f:
+            nbformat.write(nb_node, f)
+        print(f"✅ Notebook executed and saved: {nb_path}")
+
+        # Convert nbformat node → plain dict so the rest of the script works
+        nb = json.loads(nbformat.writes(nb_node))
+
+    except Exception as exc:
+        print(f"⚠️  Could not execute notebook ({exc}). Falling back to stored outputs.")
+        nb = json.load(open(nb_path, encoding="utf-8"))
+else:
+    print(f"ℹ️  Skipping execution (--no-execute). Using stored outputs.")
+    nb = json.load(open(nb_path, encoding="utf-8"))
+
+# ── CSS ──
 CSS = """
 @import url("https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600;700&display=swap");
 body {
@@ -33,12 +77,33 @@ blockquote {
 }
 code { background: #f1f5f9; padding: 1px 5px; border-radius: 3px; font-size: 11.5px; }
 pre { background: #f1f5f9; padding: 14px; border-radius: 6px; font-size: 11.5px;
-      border: 1px solid #e2e8f0; overflow-x: auto; }
+      border: 1px solid #e2e8f0; overflow-x: auto; white-space: pre-wrap; word-wrap: break-word; }
 pre code { background: none; padding: 0; }
 hr { border: none; border-top: 1px solid #e2e8f0; margin: 28px 0; }
-img { max-width: 100%; height: auto; margin: 14px 0; display: block; }
+img { max-width: 100%; height: auto; margin: 14px auto; display: block; }
 p { color: #475569; margin: 8px 0; }
 strong { color: #1a1a2e; }
+ul, ol { color: #475569; margin: 8px 0; padding-left: 24px; }
+li { margin: 4px 0; line-height: 1.6; }
+em { font-style: italic; }
+.cell-output-text {
+  background: #f8fafc; padding: 12px 14px; border-radius: 6px;
+  border: 1px solid #e2e8f0; margin: 10px 0; font-size: 11.5px;
+  font-family: 'Courier New', Courier, monospace; color: #334155;
+  white-space: pre-wrap; word-wrap: break-word; overflow-x: auto;
+}
+.cell-output-html {
+  margin: 10px 0; overflow-x: auto;
+}
+.cell-output-html table {
+  font-size: 12px; border-collapse: collapse; width: 100%;
+}
+.cell-output-html th, .cell-output-html td {
+  padding: 6px 10px; border: 1px solid #e2e8f0; text-align: left;
+}
+.cell-output-html th {
+  background: #f1f5f9; font-weight: 600;
+}
 @media print {
   body { max-width: 100%; margin: 0; padding: 20px; }
   img { page-break-inside: avoid; }
@@ -57,15 +122,55 @@ for cell in nb["cells"]:
     if cell["cell_type"] == "markdown":
         src = cell["source"] if isinstance(cell["source"], str) else "".join(cell["source"])
         parts.append(markdown.markdown(src, extensions=["tables", "fenced_code"]))
+
     elif cell["cell_type"] == "code":
         for o in cell.get("outputs", []):
-            img = o.get("data", {}).get("image/png", "")
-            if img:
-                parts.append(f'<img src="data:image/png;base64,{img}"/>')
+            output_type = o.get("output_type", "")
+
+            # Handle display_data and execute_result (both have 'data' dict)
+            if output_type in ("display_data", "execute_result"):
+                data = o.get("data", {})
+                # Prefer image/png (matplotlib charts)
+                img = data.get("image/png", "")
+                if img:
+                    # img may already be a plain string or a list of strings
+                    if isinstance(img, list):
+                        img = "".join(img)
+                    parts.append(f'<img src="data:image/png;base64,{img.strip()}"/>')
+                # Then text/html (e.g. pandas DataFrames)
+                elif "text/html" in data:
+                    html_content = data["text/html"]
+                    if isinstance(html_content, list):
+                        html_content = "".join(html_content)
+                    parts.append(f'<div class="cell-output-html">{html_content}</div>')
+                # Fallback to text/plain
+                elif "text/plain" in data:
+                    text = data["text/plain"]
+                    if isinstance(text, list):
+                        text = "".join(text)
+                    escaped = html_mod.escape(text)
+                    parts.append(f'<div class="cell-output-text">{escaped}</div>')
+
+            # Handle stream outputs (print() calls)
+            elif output_type == "stream":
+                text = o.get("text", "")
+                if isinstance(text, list):
+                    text = "".join(text)
+                escaped = html_mod.escape(text)
+                parts.append(f'<div class="cell-output-text">{escaped}</div>')
+
+            # Handle error outputs
+            elif output_type == "error":
+                traceback_lines = o.get("traceback", [])
+                text = "\n".join(traceback_lines)
+                # Strip ANSI escape codes
+                text = re.sub(r'\x1b\[[0-9;]*m', '', text)
+                escaped = html_mod.escape(text)
+                parts.append(f'<div class="cell-output-text" style="color:#dc2626;">{escaped}</div>')
 
 parts.append("</body></html>")
 
-with open(out_path, "w") as f:
+with open(out_path, "w", encoding="utf-8") as f:
     f.write("\n".join(parts))
 
 print(f"✅ Exported: {out_path}")
